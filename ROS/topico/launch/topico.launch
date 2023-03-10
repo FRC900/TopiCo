@@ -1,4 +1,7 @@
 <launch>
     <node pkg="topico" type="topico_node" name="topico" output="screen" />
+    <!--
+        <node pkg="topico" type="topico_node" name="topico" output="screen" launch-prefix="gdb -ex run -args" />
+    -->
 </launch>
 
