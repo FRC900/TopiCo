@@ -139,20 +139,21 @@ struct CTX {
     this->elevator_node.getParam("motion_magic_acceleration", elevator_max_acceleration);
     this->fourbar_node.getParam("motion_magic_velocity", fourbar_max_velocity);
     this->fourbar_node.getParam("motion_magic_acceleration", fourbar_max_acceleration);
+    
     // idx_dim + num_dim * idx_wayp
     for (int waypoint_id = 0; waypoint_id < waypoints; waypoint_id++) {
       this->velocity_max[0 + axes * waypoint_id] = elevator_max_velocity;
-      this->velocity_min[0 + axes * waypoint_id] = 0;
+      this->velocity_min[0 + axes * waypoint_id] = -elevator_max_velocity;
       this->acceleration_max[0 + axes * waypoint_id] = elevator_max_acceleration;
-      this->acceleration_min[0 + axes * waypoint_id] = 0;
+      this->acceleration_min[0 + axes * waypoint_id] = -elevator_max_acceleration;
       this->velocity_max[1 + axes * waypoint_id] = fourbar_max_velocity;
-      this->velocity_min[1 + axes * waypoint_id] = 0;
+      this->velocity_min[1 + axes * waypoint_id] = -fourbar_max_velocity;
       this->acceleration_max[1 + axes * waypoint_id] = fourbar_max_acceleration;
-      this->acceleration_min[1 + axes * waypoint_id] = 0;
+      this->acceleration_min[1 + axes * waypoint_id] = -fourbar_max_acceleration;
 
       for (int axis_id = 0; axis_id < axes; axis_id++) {
         this->direction[axis_id + axes * waypoint_id] = 1;
-        this->jerk_min[axis_id + axes * waypoint_id] = 0;
+        this->jerk_min[axis_id + axes * waypoint_id] = -2;
         this->jerk_max[axis_id + axes * waypoint_id] = 2;
         this->acceleration_global[axis_id] = 0;
         this->sync_accelerations[axis_id + axes * waypoint_id] = false;
@@ -180,8 +181,8 @@ struct CTX {
         this->initial_state[i + (AXES * 2)] = 0.0;
     }
 
-    for (int waypoint = 1; waypoint < WAYPOINTS; waypoint++) {
-        for (int axis = 0; axis < AXES; axis++) {
+    for (int axis = 0; axis < AXES; axis++) {
+        for (int waypoint = 1; waypoint < WAYPOINTS; waypoint++) {
             // Pos
             this->waypoints[(axis + AXES * 0) + AXES * 5 * (waypoint - 1)] = waypoints->waypoints[waypoint].positions[axis];
             // Vel
@@ -193,6 +194,9 @@ struct CTX {
             // Reserved
             this->waypoints[(axis + AXES * 4) + AXES * 5 * (waypoint - 1)] = 0.0;
         }
+        // Vel/Accel should be 0 at the final waypoint
+        this->waypoints[(axis + AXES * 1) + AXES * 5 * (WAYPOINTS - 1)] = 0.0;
+        this->waypoints[(axis + AXES * 2) + AXES * 5 * (WAYPOINTS - 1)] = 0.0;
     }
 
     topico_wrapper(
@@ -296,7 +300,7 @@ int main(int argc, char **argv)
   
   ros::Subscriber wayp_sub = nh.subscribe("wayp_odometry", 1, &CTX::init, &ctx, ros::TransportHints().tcpNoDelay());
   //ros::Subscriber init_sub = nh.subscribe("init_odometry", 1, init_callback, ros::TransportHints().tcpNoDelay());
-  ros::Publisher path_pub  = nh.advertise<nav_msgs::Path>("trajectory_rollout", 0);
+  ros::Publisher path_pub  = nh.advertise<topico::Waypoints>("trajectory_rollout", 0);
   
   std::string map_frame;
   nh.param<std::string>( "frame_id", map_frame, "world" );
@@ -306,7 +310,7 @@ int main(int argc, char **argv)
   // f = boost::bind(&dynamic_reconfigure_callback, _1, _2);
   // server.setCallback(f);
  
-  nav_msgs::Path path_rollout;
+  topico::Waypoints output;
   
   while (ros::ok())
   {
@@ -316,17 +320,16 @@ int main(int argc, char **argv)
     if (ctx.initialized && ctx.updated) { // only replan when new data arrived...
       ctx.updated = false;
 
-      int size_rollout = ctx.P.size(1);
-      path_rollout.poses.resize(size_rollout);
-      path_rollout.header.stamp = t_now;
-      path_rollout.header.frame_id = map_frame;
-      for (int idx = 0; idx < size_rollout; idx++)
+      int output_size = ctx.P.size(1);
+      output.waypoints.resize(2);
+      output.waypoints[0].positions.resize(output_size);
+      output.waypoints[1].positions.resize(output_size);
+      for (int idx = 0; idx < output_size; idx++)
       {
-        path_rollout.poses[idx].pose.position.x = ctx.P[3*idx+0];
-        path_rollout.poses[idx].pose.position.y = ctx.P[3*idx+1];
-        path_rollout.poses[idx].pose.position.z = ctx.P[3*idx+2];
+        output.waypoints[0].positions[idx] = ctx.P[2*idx];
+        output.waypoints[1].positions[idx] = ctx.P[2*idx+1];
       }
-      path_pub.publish(path_rollout);
+      path_pub.publish(output);
     } else if(!ctx.initialized) {
       printf("Warning: Initial state and/or waypoint not published yet!\n");       
     }
