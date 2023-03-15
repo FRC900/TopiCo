@@ -1,0 +1,9 @@
+# The waypoints, formatted:
+# [[elevator, fourbar], [elevator, fourbar], [elevator, fourbar]...]
+Targets waypoints
+---
+# [[time, pos, vel, acc for elevator], [time, pos, vel, acc for fourbar]]
+Targets times
+Targets positions
+Targets velocities
+Targets accelerations

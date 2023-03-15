@@ -1,7 +1,11 @@
 <launch>
-    <node pkg="topico" type="topico_node" name="topico" output="screen" />
-    <!--
-        <node pkg="topico" type="topico_node" name="topico" output="screen" launch-prefix="gdb -ex run -args" />
-    -->
+	<!-- GDB functionality -->
+	<arg name="debug" default="false" />
+	<arg unless="$(arg debug)" name="launch_prefix" value="" />
+	<arg if="$(arg debug)" name="launch_prefix" value="gdb --ex run --args" />
+
+    <rosparam file="$(find ros_control_boilerplate)/config/2023_elevator_params.yaml" command="load"/>
+    <rosparam file="$(find ros_control_boilerplate)/config/2023_four_bar_params.yaml" command="load"/>
+    <node pkg="topico" type="topico_node" name="topico" output="screen" launch-prefix="$(arg launch_prefix)" />
 </launch>
 

@@ -51,7 +51,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include "topico/Waypoints.h"
+#include "topico/Topico.h"
+#include "topico/Targets.h"
 
 struct CTX {
   // Initial state of the axes
@@ -83,10 +84,6 @@ struct CTX {
   coder::array<signed char, 2U> direction;
   // Timesteps when the trajectory is sampled
   double sampling_timestamps;
-  // If there's been an update
-  bool updated;
-  // If the CTX was initialized
-  bool initialized;
 
   // Outputs
   coder::array<struct0_T, 2U> J_setp_struct;
@@ -98,20 +95,117 @@ struct CTX {
   coder::array<double, 2U> J;
   coder::array<double, 2U> t;
 
-  // ROS stuff
+  // ROS nodes
   ros::NodeHandle elevator_node;
   ros::NodeHandle fourbar_node;
+  ros::NodeHandle nh;
+
+  // Debug publishers
+  ros::Publisher timePublisher;
+  ros::Publisher positionPublisher;
+  ros::Publisher velocityPublisher;
+  ros::Publisher accelerationPublisher;
+
+  // The actual service
+  ros::ServiceServer service;
+
+  // Cache previous number of axes/waypoints,
+  //  so we don't have to resize if it's the same size
+  int axesCache;
+  int waypointsCache;
 
   CTX() :
     sampling_timestamps{0.1},
-    updated{false},
-    initialized{false},
-    elevator_node("/frcrobot_jetson/elevator_controller_2023"),
-    fourbar_node("/frcrobot_jetson/four_bar_controller_2023")
-  {}
+    axesCache{0},
+    waypointsCache{0},
+    elevator_node("/elevator_controller_2023"),
+    fourbar_node("/four_bar_controller_2023"),
+    nh("topico")
+  {
+    this->timePublisher = this->nh.advertise<topico::Targets>("time", 1, true);
+    this->positionPublisher = this->nh.advertise<topico::Targets>("position", 1, true);
+    this->velocityPublisher = this->nh.advertise<topico::Targets>("velocity", 1, true);
+    this->accelerationPublisher = this->nh.advertise<topico::Targets>("acceleration", 1, true);
+
+    this->service = nh.advertiseService("topico", &CTX::callback, this);
+  }
+
+  // Service callback
+  bool callback(topico::Topico::Request& req, topico::Topico::Response& res) {
+    const int AXES = req.waypoints.targets[0].targets.size();
+    const int WAYPOINTS = req.waypoints.targets.size();
+
+    // This is in a different function because it's so bloody long
+    this->resize(AXES, WAYPOINTS);
+
+    for (int i = 0; i < AXES; i++) {
+        // Position X/Y/Z (respectively)
+        this->initial_state[i + (AXES * 0)] = req.waypoints.targets[0].targets[i];
+        // Velocity X/Y/Z (respectively, starts at 0 since nothing's moving)
+        this->initial_state[i + (AXES * 1)] = 0;
+        // Acceleration X/Y/Z (respectively)
+        this->initial_state[i + (AXES * 2)] = 0.0;
+    }
+
+    for (int axis = 0; axis < AXES; axis++) {
+        for (int waypoint = 1; waypoint < WAYPOINTS; waypoint++) {
+            // Pos
+            this->waypoints[(axis + AXES * 0) + AXES * 5 * (waypoint - 1)] = req.waypoints.targets[waypoint].targets[axis];
+            // Vel
+            this->waypoints[(axis + AXES * 1) + AXES * 5 * (waypoint - 1)] = std::numeric_limits<double>::quiet_NaN();
+            // Accel
+            this->waypoints[(axis + AXES * 2) + AXES * 5 * (waypoint - 1)] = 0.0;
+            // Movement vel
+            this->waypoints[(axis + AXES * 3) + AXES * 5 * (waypoint - 1)] = 0.0;
+            // Reserved
+            this->waypoints[(axis + AXES * 4) + AXES * 5 * (waypoint - 1)] = 0.0;
+        }
+        // Vel/Accel should be 0 at the final waypoint
+        this->waypoints[(axis + AXES * 1) + AXES * 5 * (WAYPOINTS - 2)] = 0.0;
+    }
+
+    this->runTopico();
+
+    int outputLength = this->P.size(1);
+    res.times.targets.resize(AXES);
+    res.positions.targets.resize(AXES);
+    res.velocities.targets.resize(AXES);
+    res.accelerations.targets.resize(AXES);
+
+    for (int axis = 0; axis < AXES; axis++) {
+      res.times.targets[axis].targets.resize(outputLength);
+      res.positions.targets[axis].targets.resize(outputLength);
+      res.velocities.targets[axis].targets.resize(outputLength);
+      res.accelerations.targets[axis].targets.resize(outputLength);
+
+      for (int output = 0; output < outputLength; output++) {
+        res.times.targets[axis].targets[output] = this->t[2*output+axis];
+        res.positions.targets[axis].targets[output] = this->P[2*output+axis];
+        res.velocities.targets[axis].targets[output] = this->V[2*output+axis];
+        res.accelerations.targets[axis].targets[output] = this->A[2*output+axis];
+      }
+    }
+
+    // Debug publishers
+    if (this->timePublisher.getNumSubscribers() != 0) {
+      this->timePublisher.publish(res.times);
+      this->positionPublisher.publish(res.positions);
+      this->velocityPublisher.publish(res.velocities);
+      this->accelerationPublisher.publish(res.accelerations);
+    }
+
+    return true;
+  }
 
   // Resize all the arrays, eg for new waypoints/axes
   void resize(int axes, int waypoints) {
+    if (axes == this->axesCache && waypoints == this->waypointsCache) {
+      return;
+    }
+
+    this->axesCache = axes;
+    this->waypointsCache = waypoints;
+
     waypoints--;
     this->initial_state.set_size(axes, 3);
     this->waypoints.set_size(axes, 5, waypoints);
@@ -142,19 +236,21 @@ struct CTX {
     
     // idx_dim + num_dim * idx_wayp
     for (int waypoint_id = 0; waypoint_id < waypoints; waypoint_id++) {
-      this->velocity_max[0 + axes * waypoint_id] = elevator_max_velocity;
-      this->velocity_min[0 + axes * waypoint_id] = -elevator_max_velocity;
-      this->acceleration_max[0 + axes * waypoint_id] = elevator_max_acceleration;
-      this->acceleration_min[0 + axes * waypoint_id] = -elevator_max_acceleration;
-      this->velocity_max[1 + axes * waypoint_id] = fourbar_max_velocity;
-      this->velocity_min[1 + axes * waypoint_id] = -fourbar_max_velocity;
-      this->acceleration_max[1 + axes * waypoint_id] = fourbar_max_acceleration;
-      this->acceleration_min[1 + axes * waypoint_id] = -fourbar_max_acceleration;
+      #define ELEVATOR_SLOT 0
+      #define FOURBAR_SLOT 1
+      this->velocity_max[ELEVATOR_SLOT + axes * waypoint_id] = elevator_max_velocity;
+      this->velocity_min[ELEVATOR_SLOT + axes * waypoint_id] = -elevator_max_velocity;
+      this->acceleration_max[ELEVATOR_SLOT + axes * waypoint_id] = elevator_max_acceleration;
+      this->acceleration_min[ELEVATOR_SLOT + axes * waypoint_id] = -elevator_max_acceleration;
+      this->velocity_max[FOURBAR_SLOT + axes * waypoint_id] = fourbar_max_velocity;
+      this->velocity_min[FOURBAR_SLOT + axes * waypoint_id] = -fourbar_max_velocity;
+      this->acceleration_max[FOURBAR_SLOT + axes * waypoint_id] = fourbar_max_acceleration;
+      this->acceleration_min[FOURBAR_SLOT + axes * waypoint_id] = -fourbar_max_acceleration;
 
       for (int axis_id = 0; axis_id < axes; axis_id++) {
         this->direction[axis_id + axes * waypoint_id] = 1;
-        this->jerk_min[axis_id + axes * waypoint_id] = -2;
-        this->jerk_max[axis_id + axes * waypoint_id] = 2;
+        this->jerk_min[axis_id + axes * waypoint_id] = -2.0;
+        this->jerk_max[axis_id + axes * waypoint_id] = 2.0;
         this->acceleration_global[axis_id] = 0;
         this->sync_accelerations[axis_id + axes * waypoint_id] = false;
         this->sync_axes[axis_id + axes * waypoint_id] = false;
@@ -165,40 +261,8 @@ struct CTX {
     }
   }
 
-  // (Re)initialize the CTX
-  void init(const topico::WaypointsConstPtr& waypoints) {
-    // Number of axes in each waypoint
-    const int AXES = waypoints->waypoints[0].positions.size();
-    const int WAYPOINTS = waypoints->waypoints.size();
-    this->resize(AXES, WAYPOINTS);
-
-    for (int i = 0; i < AXES; i++) {
-        // Position X/Y/Z (respectively)
-        this->initial_state[i + (AXES * 0)] = waypoints->waypoints[0].positions[i];
-        // Velocity X/Y/Z (respectively, starts at 0 since nothing's moving)
-        this->initial_state[i + (AXES * 1)] = 0;
-        // Acceleration X/Y/Z (respectively)
-        this->initial_state[i + (AXES * 2)] = 0.0;
-    }
-
-    for (int axis = 0; axis < AXES; axis++) {
-        for (int waypoint = 1; waypoint < WAYPOINTS; waypoint++) {
-            // Pos
-            this->waypoints[(axis + AXES * 0) + AXES * 5 * (waypoint - 1)] = waypoints->waypoints[waypoint].positions[axis];
-            // Vel
-            this->waypoints[(axis + AXES * 1) + AXES * 5 * (waypoint - 1)] = std::numeric_limits<double>::quiet_NaN();
-            // Accel
-            this->waypoints[(axis + AXES * 2) + AXES * 5 * (waypoint - 1)] = std::numeric_limits<double>::quiet_NaN();
-            // Movement vel
-            this->waypoints[(axis + AXES * 3) + AXES * 5 * (waypoint - 1)] = 0.0;
-            // Reserved
-            this->waypoints[(axis + AXES * 4) + AXES * 5 * (waypoint - 1)] = 0.0;
-        }
-        // Vel/Accel should be 0 at the final waypoint
-        this->waypoints[(axis + AXES * 1) + AXES * 5 * (WAYPOINTS - 1)] = 0.0;
-        this->waypoints[(axis + AXES * 2) + AXES * 5 * (WAYPOINTS - 1)] = 0.0;
-    }
-
+  // Yes.
+  void runTopico() {
     topico_wrapper(
       // State_start
       this->initial_state,
@@ -253,88 +317,16 @@ struct CTX {
       // t
       this->t
     );
-
-    // It was updated
-    this->updated = true;
-    // It was initialized
-    this->initialized = true;
   }
 };
-
-
-// void dynamic_reconfigure_callback(topico::TopiCoConfig &config, uint32_t level)
-// {
-//   for (int idx_dim = 0; idx_dim < num_dim; idx_dim++) {  
-//     A_global[idx_dim] = 0.0; 
-//     for (int idx_wayp = 0; idx_wayp < num_wayp; idx_wayp++) {
-//       V_max[idx_dim + num_dim * idx_wayp]        = config.V_max;
-//       V_min[idx_dim + num_dim * idx_wayp]        = config.V_min;
-//       A_max[idx_dim + num_dim * idx_wayp]        = config.A_max;
-//       A_min[idx_dim + num_dim * idx_wayp]        = config.A_min;
-//       J_max[idx_dim + num_dim * idx_wayp]        = config.J_max;
-//       J_min[idx_dim + num_dim * idx_wayp]        = config.J_min;
-//       b_sync_V[idx_dim + num_dim * idx_wayp]     = config.b_sync_V;
-//       b_sync_A[idx_dim + num_dim * idx_wayp]     = config.b_sync_A;
-//       b_sync_J[idx_dim + num_dim * idx_wayp]     = config.b_sync_J;
-//       b_sync_W[idx_dim + num_dim * idx_wayp]     = config.b_sync_W;
-//       b_hard_V_lim[idx_dim + num_dim * idx_wayp] = config.b_hard_V_lim;
-//       b_catch_up[idx_dim + num_dim * idx_wayp]   = config.b_catch_up;
-//       direction[idx_dim + num_dim * idx_wayp]    = config.direction;
-//     }
-//   }  
-//   for (int idx_dim = 0; idx_dim < num_dim-1; idx_dim++) {  
-//     for (int idx_wayp = 0; idx_wayp < num_wayp; idx_wayp++) {
-//       b_rotate[idx_dim + num_dim * idx_wayp]     = config.b_rotate;
-//     }
-//   }
-//   ts_rollout = config.ts_rollout;
-// }
 
 
 int main(int argc, char **argv)
 {
   ros::init(argc, argv, "topico");
-  ros::NodeHandle nh("/topico");
-  ros::Rate loop_rate(100);
   CTX ctx;
-  
-  ros::Subscriber wayp_sub = nh.subscribe("wayp_odometry", 1, &CTX::init, &ctx, ros::TransportHints().tcpNoDelay());
-  //ros::Subscriber init_sub = nh.subscribe("init_odometry", 1, init_callback, ros::TransportHints().tcpNoDelay());
-  ros::Publisher path_pub  = nh.advertise<topico::Waypoints>("trajectory_rollout", 0);
-  
-  std::string map_frame;
-  nh.param<std::string>( "frame_id", map_frame, "world" );
-  
-  // dynamic_reconfigure::Server<topico::TopiCoConfig> server;
-  // dynamic_reconfigure::Server<topico::TopiCoConfig>::CallbackType f;
-  // f = boost::bind(&dynamic_reconfigure_callback, _1, _2);
-  // server.setCallback(f);
  
-  topico::Waypoints output;
-  
-  while (ros::ok())
-  {
-    ros::spinOnce();
-    ros::Time t_now = ros::Time::now();
-
-    if (ctx.initialized && ctx.updated) { // only replan when new data arrived...
-      ctx.updated = false;
-
-      int output_size = ctx.P.size(1);
-      output.waypoints.resize(2);
-      output.waypoints[0].positions.resize(output_size);
-      output.waypoints[1].positions.resize(output_size);
-      for (int idx = 0; idx < output_size; idx++)
-      {
-        output.waypoints[0].positions[idx] = ctx.P[2*idx];
-        output.waypoints[1].positions[idx] = ctx.P[2*idx+1];
-      }
-      path_pub.publish(output);
-    } else if(!ctx.initialized) {
-      printf("Warning: Initial state and/or waypoint not published yet!\n");       
-    }
-    loop_rate.sleep();
-  }
+  ros::spin();
 
   topico_wrapper_terminate();
   return 0;
